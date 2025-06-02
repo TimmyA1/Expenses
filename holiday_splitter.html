@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Holiday Expense Splitter with Gemini AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        // Firebase App (the core Firebase SDK) is always required and must be listed first
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, addDoc, getDoc, getDocs, deleteDoc, onSnapshot, collection, query, writeBatch, runTransaction, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Configuration (DO NOT EDIT) ---
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "YOUR_AUTH_DOMAIN", projectId: "YOUR_PROJECT_ID" }; // Fallback for local dev
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-holiday-splitter-app';
+        // --- End Configuration ---
+
+        // --- Gemini API Configuration ---
+        const GEMINI_API_KEY = ""; // Provided by Canvas environment
+        const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=";
+        // --- End Gemini API Configuration ---
+
+
+        let app;
+        let auth;
+        let db;
+        let userId = null;
+        let isAuthReady = false;
+
+        let participants = [];
+        let expenses = [];
+
+        let participantsUnsubscribe = null;
+        let expensesUnsubscribe = null;
+
+        // DOM Elements
+        const participantNameInput = document.getElementById('participantName');
+        const addParticipantButton = document.getElementById('addParticipantButton');
+        const participantsListDiv = document.getElementById('participantsList');
+        
+        const expenseDescriptionInput = document.getElementById('expenseDescription');
+        const expenseAmountInput = document.getElementById('expenseAmount');
+        const expensePaidBySelect = document.getElementById('expensePaidBy');
+        const expenseSharedByDiv = document.getElementById('expenseSharedBy');
+        const addExpenseButton = document.getElementById('addExpenseButton');
+        const suggestSharersButton = document.getElementById('suggestSharersButton'); // New
+        const expensesListDiv = document.getElementById('expensesList');
+        
+        const calculateButton = document.getElementById('calculateButton');
+        const generateReportButton = document.getElementById('generateReportButton'); // New
+        const resultsDiv = document.getElementById('results');
+        const spendingReportDiv = document.getElementById('spendingReportDiv'); // New
+        
+        const userIdDiv = document.getElementById('userIdDiv');
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        const errorModal = document.getElementById('errorModal');
+        const errorMessage = document.getElementById('errorMessage');
+        const closeErrorModalButton = document.getElementById('closeErrorModalButton');
+
+        // --- Utility Functions ---
+        function showLoading(message = "Loading...") {
+            if (loadingOverlay) {
+                loadingOverlay.classList.remove('hidden');
+                loadingOverlay.querySelector('p').textContent = message;
+            }
+        }
+
+        function hideLoading() {
+            if (loadingOverlay) {
+                loadingOverlay.classList.add('hidden');
+            }
+        }
+
+        function showErrorModal(message) {
+            if (errorMessage && errorModal && closeErrorModalButton) {
+                errorMessage.textContent = message;
+                errorModal.classList.remove('hidden');
+            } else {
+                console.error("Error modal elements not found. Message:", message);
+                console.error("Fallback error display:", message);
+            }
+        }
+        
+        if (closeErrorModalButton) {
+            closeErrorModalButton.addEventListener('click', () => {
+                if (errorModal) errorModal.classList.add('hidden');
+            });
+        } else {
+            console.warn("Close error modal button not found during initial setup.");
+        }
+
+
+        // --- Firebase Initialization and Auth ---
+        async function initializeFirebase() {
+            try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                setLogLevel('debug'); 
+
+                await setPersistence(auth, browserLocalPersistence); 
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("User is signed in with UID:", userId);
+                        if (userIdDiv) userIdDiv.textContent = `Your User ID: ${userId}`;
+                        isAuthReady = true;
+                        await loadInitialData();
+                    } else {
+                        console.log("User is signed out. Attempting to sign in...");
+                        userId = null;
+                        isAuthReady = false; 
+                        if (userIdDiv) userIdDiv.textContent = "User ID: Not signed in";
+                        await signIn(); 
+                    }
+                    hideLoading();
+                });
+            } catch (error) {
+                console.error("Firebase initialization error:", error);
+                showErrorModal(`Firebase initialization failed: ${error.message}. Try refreshing.`);
+                hideLoading();
+            }
+        }
+
+        async function signIn() {
+            showLoading("Authenticating...");
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    console.log("Attempting to sign in with custom token...");
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    console.log("Attempting to sign in anonymously...");
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Error signing in:", error);
+                showErrorModal(`Authentication failed: ${error.message}. Some features might not work.`);
+                isAuthReady = true; 
+                if (userIdDiv) userIdDiv.textContent = `User ID: Error (${error.message.substring(0,20)})`;
+                hideLoading();
+            }
+        }
+        
+        // --- Firestore Paths ---
+        function getParticipantsCollectionRef() {
+            return collection(db, "artifacts", appId, "public", "data", "holiday-splitter-participants");
+        }
+
+        function getExpensesCollectionRef() {
+            return collection(db, "artifacts", appId, "public", "data", "holiday-splitter-expenses");
+        }
+
+        // --- Participant Management ---
+        async function addParticipant() {
+            if (!isAuthReady || !userId) {
+                showErrorModal("Authentication not ready. Please wait or refresh.");
+                return;
+            }
+            const name = participantNameInput.value.trim();
+            if (!name) {
+                showErrorModal("Participant name cannot be empty.");
+                return;
+            }
+            if (participants.find(p => p.name.toLowerCase() === name.toLowerCase())) {
+                showErrorModal("Participant with this name already exists.");
+                return;
+            }
+
+            showLoading("Adding participant...");
+            try {
+                const participantRef = doc(collection(db, "artifacts", appId, "public", "data", "holiday-splitter-participants"));
+                await setDoc(participantRef, { name: name, createdAt: serverTimestamp() });
+                participantNameInput.value = '';
+            } catch (error) {
+                console.error("Error adding participant:", error);
+                showErrorModal(`Failed to add participant: ${error.message}`);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        function renderParticipants() {
+            if (!participantsListDiv || !expensePaidBySelect || !expenseSharedByDiv) return;
+
+            participantsListDiv.innerHTML = '';
+            expensePaidBySelect.innerHTML = '<option value="">Select Payer</option>';
+            expenseSharedByDiv.innerHTML = '';
+
+            if (participants.length === 0) {
+                participantsListDiv.innerHTML = '<p class="text-gray-500">No participants added yet.</p>';
+                expenseSharedByDiv.innerHTML = '<p class="text-gray-400 text-sm">Add participants first</p>';
+            } else {
+                 participants.sort((a,b) => a.name.localeCompare(b.name)).forEach(participant => {
+                    const pElement = document.createElement('div');
+                    pElement.className = 'flex justify-between items-center bg-white p-3 rounded-lg shadow mb-2';
+                    pElement.innerHTML = `
+                        <span class="text-gray-700">${participant.name}</span>
+                        <button data-id="${participant.id}" class="remove-participant-btn text-red-500 hover:text-red-700 text-sm">Remove</button>
+                    `;
+                    participantsListDiv.appendChild(pElement);
+
+                    const option = document.createElement('option');
+                    option.value = participant.id;
+                    option.textContent = participant.name;
+                    expensePaidBySelect.appendChild(option);
+
+                    const checkboxDiv = document.createElement('div');
+                    checkboxDiv.className = 'flex items-center';
+                    checkboxDiv.innerHTML = `
+                        <input type="checkbox" id="shared-${participant.id}" value="${participant.id}" data-name="${participant.name}" class="shared-by-checkbox h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mr-2">
+                        <label for="shared-${participant.id}" class="text-gray-700">${participant.name}</label>
+                    `;
+                    expenseSharedByDiv.appendChild(checkboxDiv);
+                });
+            }
+            addRemoveParticipantButtonListeners();
+        }
+        
+        function addRemoveParticipantButtonListeners() {
+            document.querySelectorAll('.remove-participant-btn').forEach(button => {
+                button.addEventListener('click', async (e) => {
+                    const participantId = e.target.dataset.id;
+                    const participantToRemove = participants.find(p => p.id === participantId);
+                    // Using a custom modal for confirmation would be better, but confirm is simpler for now.
+                    const customConfirmModal = document.getElementById('customConfirmModal');
+                    const confirmMessage = document.getElementById('confirmMessage');
+                    const confirmYesButton = document.getElementById('confirmYesButton');
+                    const confirmNoButton = document.getElementById('confirmNoButton');
+
+                    if (customConfirmModal && confirmMessage && confirmYesButton && confirmNoButton && participantToRemove) {
+                        confirmMessage.textContent = `Are you sure you want to remove ${participantToRemove.name}? This will also update related expenses.`;
+                        customConfirmModal.classList.remove('hidden');
+
+                        confirmYesButton.onclick = async () => {
+                            customConfirmModal.classList.add('hidden');
+                            await removeParticipant(participantId);
+                        };
+                        confirmNoButton.onclick = () => {
+                            customConfirmModal.classList.add('hidden');
+                        };
+                    } else {
+                         // Fallback if modal elements are not found (should not happen)
+                        if (confirm(`Are you sure you want to remove this participant? This will also remove them from any expenses they paid or shared.`)) {
+                           await removeParticipant(participantId);
+                        }
+                    }
+                });
+            });
+        }
+
+        async function removeParticipant(participantId) {
+            if (!isAuthReady || !userId) {
+                showErrorModal("Authentication not ready. Please wait or refresh.");
+                return;
+            }
+            showLoading("Removing participant and updating expenses...");
+            try {
+                const batch = writeBatch(db);
+                const participantDocRef = doc(db, "artifacts", appId, "public", "data", "holiday-splitter-participants", participantId);
+                batch.delete(participantDocRef);
+                
+                const expensesToUpdate = expenses.filter(exp => exp.paidBy === participantId || exp.sharedBy.includes(participantId));
+
+                for (const expense of expensesToUpdate) {
+                    const expenseDocRef = doc(db, "artifacts", appId, "public", "data", "holiday-splitter-expenses", expense.id);
+                    let updateData = {};
+                    if (expense.paidBy === participantId) {
+                         updateData.paidBy = "Unknown (Removed Participant)"; 
+                    }
+                    
+                    const newSharedBy = expense.sharedBy.filter(id => id !== participantId);
+                    if (newSharedBy.length < expense.sharedBy.length) { 
+                        updateData.sharedBy = newSharedBy;
+                    }
+                    if (Object.keys(updateData).length > 0) {
+                        batch.update(expenseDocRef, updateData);
+                    }
+                }
+                await batch.commit();
+            } catch (error) {
+                console.error("Error removing participant:", error);
+                showErrorModal(`Failed to remove participant: ${error.message}`);
+            } finally {
+                hideLoading();
+            }
+        }
+
+
+        // --- Expense Management ---
+        async function addExpense() {
+            if (!isAuthReady || !userId) {
+                showErrorModal("Authentication not ready. Please wait or refresh.");
+                return;
+            }
+            const description = expenseDescriptionInput.value.trim();
+            const amount = parseFloat(expenseAmountInput.value);
+            const paidBy = expensePaidBySelect.value;
+            const sharedByCheckboxes = document.querySelectorAll('.shared-by-checkbox:checked');
+            const sharedBy = Array.from(sharedByCheckboxes).map(cb => cb.value);
+
+            if (!description) { showErrorModal("Expense description cannot be empty."); return; }
+            if (isNaN(amount) || amount <= 0) { showErrorModal("Expense amount must be a positive number."); return; }
+            if (!paidBy) { showErrorModal("Please select who paid for the expense."); return; }
+            if (sharedBy.length === 0) { showErrorModal("Please select at least one participant who shared the expense."); return; }
+
+            showLoading("Adding expense...");
+            try {
+                const expenseRef = doc(collection(db, "artifacts", appId, "public", "data", "holiday-splitter-expenses"));
+                await setDoc(expenseRef, { description, amount, paidBy, sharedBy, createdAt: serverTimestamp() });
+                expenseDescriptionInput.value = '';
+                expenseAmountInput.value = '';
+                expensePaidBySelect.value = '';
+                document.querySelectorAll('.shared-by-checkbox').forEach(cb => cb.checked = false);
+            } catch (error) {
+                console.error("Error adding expense:", error);
+                showErrorModal(`Failed to add expense: ${error.message}`);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        function renderExpenses() {
+            if (!expensesListDiv) return;
+            expensesListDiv.innerHTML = '';
+
+            if (expenses.length === 0) {
+                expensesListDiv.innerHTML = '<p class="text-gray-500">No expenses added yet.</p>';
+                return;
+            }
+
+            const sortedExpenses = [...expenses].sort((a,b) => (a.createdAt && b.createdAt && a.createdAt.seconds && b.createdAt.seconds) ? b.createdAt.seconds - a.createdAt.seconds : a.description.localeCompare(b.description));
+
+            sortedExpenses.forEach(expense => {
+                const payer = participants.find(p => p.id === expense.paidBy);
+                const sharedByNames = expense.sharedBy.map(id => participants.find(p => p.id === id)?.name || 'Unknown').join(', ');
+
+                const expenseElement = document.createElement('div');
+                expenseElement.className = 'bg-white p-4 rounded-lg shadow mb-3';
+                expenseElement.innerHTML = `
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h4 class="font-semibold text-lg text-blue-700">${expense.description}</h4>
+                            <p class="text-gray-600 text-sm">Amount: $${expense.amount.toFixed(2)}</p>
+                            <p class="text-gray-600 text-sm">Paid by: ${payer ? payer.name : (expense.paidBy === "Unknown (Removed Participant)" ? "<span class='text-red-500'>Removed Payer</span>" : 'Unknown')}</p>
+                            <p class="text-gray-600 text-sm">Shared by: ${sharedByNames || (expense.sharedBy.length === 0 ? "<span class='text-orange-500'>None (Needs Attention)</span>" : 'None')}</p>
+                        </div>
+                        <button data-id="${expense.id}" class="remove-expense-btn text-red-500 hover:text-red-700 text-sm font-medium">Remove</button>
+                    </div>
+                `;
+                expensesListDiv.appendChild(expenseElement);
+            });
+            addRemoveExpenseButtonListeners();
+        }
+
+        function addRemoveExpenseButtonListeners() {
+            document.querySelectorAll('.remove-expense-btn').forEach(button => {
+                button.addEventListener('click', async (e) => {
+                    const expenseId = e.target.dataset.id;
+                    const expenseToRemove = expenses.find(ex => ex.id === expenseId);
+                    const customConfirmModal = document.getElementById('customConfirmModal');
+                    const confirmMessage = document.getElementById('confirmMessage');
+                    const confirmYesButton = document.getElementById('confirmYesButton');
+                    const confirmNoButton = document.getElementById('confirmNoButton');
+
+                    if (customConfirmModal && confirmMessage && confirmYesButton && confirmNoButton && expenseToRemove) {
+                        confirmMessage.textContent = `Are you sure you want to remove the expense: "${expenseToRemove.description}"?`;
+                        customConfirmModal.classList.remove('hidden');
+
+                        confirmYesButton.onclick = async () => {
+                            customConfirmModal.classList.add('hidden');
+                            await removeExpense(expenseId);
+                        };
+                        confirmNoButton.onclick = () => {
+                            customConfirmModal.classList.add('hidden');
+                        };
+                    } else {
+                        if (confirm(`Are you sure you want to remove this expense?`)) {
+                            await removeExpense(expenseId);
+                        }
+                    }
+                });
+            });
+        }
+
+        async function removeExpense(expenseId) {
+             if (!isAuthReady || !userId) { showErrorModal("Authentication not ready. Please wait or refresh."); return; }
+            showLoading("Removing expense...");
+            try {
+                const expenseDocRef = doc(db, "artifacts", appId, "public", "data", "holiday-splitter-expenses", expenseId);
+                await deleteDoc(expenseDocRef);
+            } catch (error) {
+                console.error("Error removing expense:", error);
+                showErrorModal(`Failed to remove expense: ${error.message}`);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        // --- Calculation Logic ---
+        function calculateSettlements() {
+            if (participants.length === 0) {
+                showErrorModal("Please add participants before calculating.");
+                resultsDiv.innerHTML = '<p class="text-gray-500">Add participants to begin.</p>';
+                return;
+            }
+            if (expenses.length === 0) {
+                 resultsDiv.innerHTML = '<p class="text-center text-gray-600">No expenses to settle.</p>';
+                return;
+            }
+
+            const balances = {}; 
+            participants.forEach(p => balances[p.id] = 0);
+
+            expenses.forEach(expense => {
+                if (!expense.paidBy || !participants.find(p => p.id === expense.paidBy) && expense.paidBy !== "Unknown (Removed Participant)") {
+                    console.warn(`Expense "${expense.description}" has an invalid or missing payer. Skipping.`);
+                    return; 
+                }
+                if (!expense.sharedBy || expense.sharedBy.length === 0) {
+                     console.warn(`Expense "${expense.description}" is not shared by anyone. Skipping.`);
+                    return; 
+                }
+                
+                if (expense.paidBy !== "Unknown (Removed Participant)") {
+                    balances[expense.paidBy] += expense.amount;
+                }
+
+
+                const shareAmount = expense.amount / expense.sharedBy.length;
+                expense.sharedBy.forEach(sharerId => {
+                    if (balances[sharerId] !== undefined) { 
+                        balances[sharerId] -= shareAmount;
+                    } else {
+                        console.warn(`Expense "${expense.description}" shared by an unknown participant ID: ${sharerId}.`);
+                    }
+                });
+            });
+
+            const debtors = []; 
+            const creditors = []; 
+
+            for (const participantId in balances) {
+                const balance = balances[participantId];
+                if (balance < -0.001) { 
+                    debtors.push({ id: participantId, amount: -balance });
+                } else if (balance > 0.001) { 
+                    creditors.push({ id: participantId, amount: balance });
+                }
+            }
+            
+            debtors.sort((a, b) => b.amount - a.amount); 
+            creditors.sort((a, b) => b.amount - a.amount); 
+
+            const transactions = [];
+            let debtorIndex = 0;
+            let creditorIndex = 0;
+
+            while (debtorIndex < debtors.length && creditorIndex < creditors.length) {
+                const debtor = debtors[debtorIndex];
+                const creditor = creditors[creditorIndex];
+                const amountToTransfer = Math.min(debtor.amount, creditor.amount);
+
+                if (amountToTransfer > 0.001) { 
+                    transactions.push({ from: debtor.id, to: creditor.id, amount: amountToTransfer });
+                    debtor.amount -= amountToTransfer;
+                    creditor.amount -= amountToTransfer;
+                }
+
+                if (debtor.amount < 0.001) { debtorIndex++; }
+                if (creditor.amount < 0.001) { creditorIndex++; }
+            }
+            renderResults(transactions, balances);
+        }
+
+        function renderResults(transactions, balances) {
+            resultsDiv.innerHTML = '';
+
+            const summaryTitle = document.createElement('h3');
+            summaryTitle.className = 'text-xl font-semibold mb-3 text-gray-800';
+            summaryTitle.textContent = 'Settlement Summary';
+            resultsDiv.appendChild(summaryTitle);
+
+            if (transactions.length === 0) {
+                const noTransactionsMsg = document.createElement('p');
+                noTransactionsMsg.className = 'text-gray-600';
+                noTransactionsMsg.textContent = 'Everyone is settled up, or no valid expenses to settle!';
+                resultsDiv.appendChild(noTransactionsMsg);
+            } else {
+                const ul = document.createElement('ul');
+                ul.className = 'space-y-2';
+                transactions.forEach(t => {
+                    const fromParticipant = participants.find(p => p.id === t.from);
+                    const toParticipant = participants.find(p => p.id === t.to);
+                    if (fromParticipant && toParticipant) {
+                        const li = document.createElement('li');
+                        li.className = 'p-3 bg-green-50 rounded-lg shadow-sm flex items-center';
+                        li.innerHTML = `
+                            <span class="font-medium text-green-700">${fromParticipant.name}</span>
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5 mx-2 text-green-600">
+                                <path fill-rule="evenodd" d="M2 10a.75.75 0 01.75-.75h12.59l-2.1-1.95a.75.75 0 111.02-1.1l3.5 3.25a.75.75 0 010 1.1l-3.5 3.25a.75.75 0 11-1.02-1.1l2.1-1.95H2.75A.75.75 0 012 10z" clip-rule="evenodd" />
+                            </svg>
+                            <span class="font-medium text-green-700">${toParticipant.name}</span>: 
+                            <span class="ml-2 text-green-800 font-semibold">$${t.amount.toFixed(2)}</span>`;
+                        ul.appendChild(li);
+                    }
+                });
+                resultsDiv.appendChild(ul);
+            }
+
+            const balancesTitle = document.createElement('h4');
+            balancesTitle.className = 'text-lg font-semibold mt-6 mb-2 text-gray-700';
+            balancesTitle.textContent = 'Final Balances:';
+            resultsDiv.appendChild(balancesTitle);
+
+            const balancesList = document.createElement('ul');
+            balancesList.className = 'space-y-1';
+            participants.forEach(p => {
+                const balance = balances[p.id] || 0;
+                const li = document.createElement('li');
+                li.className = `p-2 rounded ${balance > 0.001 ? 'bg-blue-50 text-blue-700' : balance < -0.001 ? 'bg-red-50 text-red-700' : 'bg-gray-50 text-gray-600'}`;
+                li.textContent = `${p.name}: $${balance.toFixed(2)} (${balance > 0.001 ? 'is owed' : balance < -0.001 ? 'owes' : 'settled'})`;
+                balancesList.appendChild(li);
+            });
+            resultsDiv.appendChild(balancesList);
+        }
+        
+        // --- Gemini API Functions ---
+        async function handleSuggestSharers() {
+            const description = expenseDescriptionInput.value.trim();
+            if (!description) {
+                showErrorModal("Please enter an expense description first.");
+                return;
+            }
+            if (participants.length === 0) {
+                showErrorModal("Please add participants before suggesting sharers.");
+                return;
+            }
+
+            showLoading("✨ Asking AI to suggest sharers...");
+            const participantNames = participants.map(p => p.name);
+            const prompt = `Given the expense description: "${description}", and the list of holiday participants: ${JSON.stringify(participantNames)}, identify which of these participants likely shared in this specific expense. Return your answer as a JSON array containing only the names of the involved participants from the provided list. For example, if Alice and Bob shared, return ["Alice", "Bob"]. If the description is unclear or no specific participants are mentioned, return an empty array [].`;
+
+            try {
+                const chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+                const payload = {
+                    contents: chatHistory,
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: {
+                            type: "ARRAY",
+                            items: { type: "STRING" }
+                        }
+                    }
+                };
+                
+                const response = await fetch(`${GEMINI_API_BASE_URL}${GEMINI_API_KEY}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error("Gemini API error response:", errorData);
+                    throw new Error(`Gemini API request failed: ${response.status} ${response.statusText}. ${errorData?.error?.message || ''}`);
+                }
+
+                const result = await response.json();
+                
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    
+                    const suggestedNamesText = result.candidates[0].content.parts[0].text;
+                    const suggestedNames = JSON.parse(suggestedNamesText); // This should be an array of names
+
+                    if (Array.isArray(suggestedNames)) {
+                        document.querySelectorAll('.shared-by-checkbox').forEach(checkbox => {
+                            checkbox.checked = suggestedNames.includes(checkbox.dataset.name);
+                        });
+                        if (suggestedNames.length === 0) {
+                             showErrorModal("AI could not confidently suggest sharers based on the description. Please select manually.", "info"); // Using showErrorModal for info too
+                        }
+                    } else {
+                        throw new Error("AI response for sharers was not in the expected array format.");
+                    }
+                } else {
+                    console.warn("Gemini API response structure unexpected or content missing for sharer suggestion:", result);
+                    throw new Error("AI could not suggest sharers due to an unexpected response format.");
+                }
+
+            } catch (error) {
+                console.error("Error suggesting sharers with Gemini API:", error);
+                showErrorModal(`✨ AI Suggestion Failed: ${error.message}`);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        async function handleGenerateSpendingReport() {
+            if (expenses.length === 0) {
+                showErrorModal("Please add some expenses before generating a report.");
+                return;
+            }
+            showLoading("✨ AI is generating your spending report...");
+            spendingReportDiv.innerHTML = '<p class="text-gray-500">Generating report...</p>';
+
+            const participantNameMap = participants.reduce((map, p) => {
+                map[p.id] = p.name;
+                return map;
+            }, {});
+
+            const simplifiedExpenses = expenses.map(e => ({
+                description: e.description,
+                amount: e.amount,
+                paidBy: participantNameMap[e.paidBy] || e.paidBy, // Use name or ID if not found
+                sharedBy: e.sharedBy.map(id => participantNameMap[id] || id).join(', ')
+            }));
+
+            const prompt = `Generate a brief spending report for a holiday. Here are the expenses: ${JSON.stringify(simplifiedExpenses)}. Analyze the spending, mention total spending, any notable expense categories if discernible from descriptions, and perhaps who paid the most or for the most items. Keep it concise and friendly.`;
+            
+            try {
+                const chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+                const payload = { contents: chatHistory };
+
+                const response = await fetch(`${GEMINI_API_BASE_URL}${GEMINI_API_KEY}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                     console.error("Gemini API error response:", errorData);
+                    throw new Error(`Gemini API request failed: ${response.status} ${response.statusText}. ${errorData?.error?.message || ''}`);
+                }
+                
+                const result = await response.json();
+
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    const reportText = result.candidates[0].content.parts[0].text;
+                    // Sanitize HTML slightly before inserting
+                    const sanitizedReportText = reportText.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
+                    spendingReportDiv.innerHTML = `<div class="prose prose-sm max-w-none p-4 bg-blue-50 rounded-lg">${sanitizedReportText}</div>`;
+                } else {
+                    console.warn("Gemini API response structure unexpected or content missing for report:", result);
+                    throw new Error("AI could not generate report due to an unexpected response format.");
+                }
+
+            } catch (error) {
+                console.error("Error generating spending report with Gemini API:", error);
+                showErrorModal(`✨ AI Report Failed: ${error.message}`);
+                spendingReportDiv.innerHTML = `<p class="text-red-500">Failed to generate report: ${error.message}</p>`;
+            } finally {
+                hideLoading();
+            }
+        }
+
+
+        // --- Data Loading and Real-time Updates ---
+        async function loadInitialData() {
+            if (!isAuthReady || !db) {
+                console.log("Auth or DB not ready for initial data load.");
+                return;
+            }
+            showLoading("Loading data...");
+
+            if (participantsUnsubscribe) participantsUnsubscribe();
+            if (expensesUnsubscribe) expensesUnsubscribe();
+
+            const participantsQuery = query(getParticipantsCollectionRef());
+            participantsUnsubscribe = onSnapshot(participantsQuery, (snapshot) => {
+                participants = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderParticipants();
+                renderExpenses(); 
+                if (expenses.length > 0) calculateSettlements(); 
+                console.log("Participants updated:", participants);
+                hideLoading();
+            }, (error) => {
+                console.error("Error fetching participants:", error);
+                showErrorModal(`Error loading participants: ${error.message}`);
+                hideLoading();
+            });
+
+            const expensesQuery = query(getExpensesCollectionRef());
+            expensesUnsubscribe = onSnapshot(expensesQuery, (snapshot) => {
+                expenses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderExpenses();
+                if (participants.length > 0) calculateSettlements(); 
+                console.log("Expenses updated:", expenses);
+                hideLoading();
+            }, (error) => {
+                console.error("Error fetching expenses:", error);
+                showErrorModal(`Error loading expenses: ${error.message}`);
+                hideLoading();
+            });
+        }
+
+
+        // --- Event Listeners ---
+        document.addEventListener('DOMContentLoaded', async () => {
+            showLoading("Initializing application...");
+            await initializeFirebase(); 
+
+            if (addParticipantButton) addParticipantButton.addEventListener('click', addParticipant);
+            if (addExpenseButton) addExpenseButton.addEventListener('click', addExpense);
+            if (calculateButton) calculateButton.addEventListener('click', calculateSettlements);
+            
+            // New Gemini feature listeners
+            if (suggestSharersButton) suggestSharersButton.addEventListener('click', handleSuggestSharers);
+            if (generateReportButton) generateReportButton.addEventListener('click', handleGenerateSpendingReport);
+
+            // Show suggest sharers button only when description has text
+            if(expenseDescriptionInput && suggestSharersButton) {
+                expenseDescriptionInput.addEventListener('input', () => {
+                    if (expenseDescriptionInput.value.trim().length > 0 && participants.length > 0) {
+                        suggestSharersButton.classList.remove('hidden');
+                    } else {
+                        suggestSharersButton.classList.add('hidden');
+                    }
+                });
+                 // Initially hide if no description or participants
+                if (!expenseDescriptionInput.value.trim() || participants.length === 0) {
+                    suggestSharersButton.classList.add('hidden');
+                }
+            }
+        });
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f4f8; 
+        }
+        .card {
+            background-color: white;
+            border-radius: 0.75rem; 
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            padding: 1.5rem; 
+            margin-bottom: 1.5rem; 
+        }
+        .btn-primary {
+            background-color: #2563eb; 
+            color: white;
+            font-weight: 500;
+            padding: 0.625rem 1.25rem; 
+            border-radius: 0.5rem; 
+            transition: background-color 0.2s;
+        }
+        .btn-primary:hover {
+            background-color: #1d4ed8; 
+        }
+        .btn-secondary {
+            background-color: #4b5563; 
+            color: white;
+             font-weight: 500;
+            padding: 0.625rem 1.25rem; 
+            border-radius: 0.5rem; 
+            transition: background-color 0.2s;
+        }
+        .btn-secondary:hover {
+             background-color: #374151; 
+        }
+        .btn-ai { /* For Gemini buttons */
+            background-color: #8b5cf6; /* purple-500 */
+            color: white;
+            font-weight: 500;
+            padding: 0.625rem 1.25rem;
+            border-radius: 0.5rem;
+            transition: background-color 0.2s;
+        }
+        .btn-ai:hover {
+            background-color: #7c3aed; /* purple-600 */
+        }
+        .input-field {
+            border: 1px solid #d1d5db; 
+            padding: 0.5rem 0.75rem; 
+            border-radius: 0.375rem; 
+            width: 100%;
+        }
+        .input-field:focus {
+            outline: none;
+            border-color: #2563eb; 
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+        }
+        #expenseSharedBy {
+            max-height: 150px;
+            overflow-y: auto;
+            border: 1px solid #e5e7eb; 
+            padding: 0.75rem;
+            border-radius: 0.375rem;
+        }
+        #expenseSharedBy::-webkit-scrollbar { width: 8px; }
+        #expenseSharedBy::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
+        #expenseSharedBy::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        #expenseSharedBy::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 50;
+        }
+        .modal-content {
+            background-color: white; padding: 2rem; border-radius: 0.5rem;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
+            width: 90%; max-width: 500px;
+        }
+        /* Styles for custom confirm modal */
+        .confirm-modal-content {
+            background-color: white; padding: 1.5rem; border-radius: 0.5rem;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
+            width: 90%; max-width: 400px; text-align: center;
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+
+    <div id="loadingOverlay" class="modal-overlay hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl text-center">
+            <svg class="animate-spin h-12 w-12 text-blue-600 mx-auto mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="text-lg font-medium text-gray-700">Loading...</p>
+        </div>
+    </div>
+
+    <div id="errorModal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <h3 class="text-xl font-semibold text-red-600 mb-4">Notice</h3>
+            <p id="errorMessage" class="text-gray-700 mb-6">An error occurred.</p>
+            <button id="closeErrorModalButton" class="btn-secondary w-full">Close</button>
+        </div>
+    </div>
+
+    <div id="customConfirmModal" class="modal-overlay hidden">
+        <div class="confirm-modal-content">
+            <h3 class="text-lg font-semibold text-gray-800 mb-3">Confirm Action</h3>
+            <p id="confirmMessage" class="text-gray-600 mb-6">Are you sure?</p>
+            <div class="flex justify-center space-x-4">
+                <button id="confirmYesButton" class="btn-primary bg-red-500 hover:bg-red-600 px-6">Yes</button>
+                <button id="confirmNoButton" class="btn-secondary px-6">No</button>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="container mx-auto max-w-4xl">
+        <header class="mb-8 text-center">
+            <h1 class="text-4xl font-bold text-gray-800">Holiday Expense Splitter <span class="text-purple-600">AI ✨</span></h1>
+            <p class="text-gray-600 mt-2">Easily manage and settle group expenses with AI-powered suggestions.</p>
+            <div id="userIdDiv" class="mt-2 text-xs text-gray-500">User ID: Loading...</div>
+        </header>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <section class="card">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-700">1. Participants</h2>
+                <div class="mb-4">
+                    <label for="participantName" class="block text-sm font-medium text-gray-700 mb-1">Participant Name:</label>
+                    <div class="flex">
+                        <input type="text" id="participantName" class="input-field flex-grow mr-2" placeholder="E.g., Alice">
+                        <button id="addParticipantButton" class="btn-primary whitespace-nowrap">Add Participant</button>
+                    </div>
+                </div>
+                <div id="participantsList" class="space-y-2">
+                    <p class="text-gray-500">Loading participants...</p>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-700">2. Expenses</h2>
+                <div class="space-y-4">
+                    <div>
+                        <label for="expenseDescription" class="block text-sm font-medium text-gray-700 mb-1">Description:</label>
+                        <input type="text" id="expenseDescription" class="input-field" placeholder="E.g., Dinner, Hotel tickets for Alice & Bob">
+                    </div>
+                    <div>
+                        <label for="expenseAmount" class="block text-sm font-medium text-gray-700 mb-1">Amount ($):</label>
+                        <input type="number" id="expenseAmount" class="input-field" placeholder="E.g., 50.00" step="0.01">
+                    </div>
+                    <div>
+                        <label for="expensePaidBy" class="block text-sm font-medium text-gray-700 mb-1">Paid By:</label>
+                        <select id="expensePaidBy" class="input-field">
+                            <option value="">Select Payer</option>
+                        </select>
+                    </div>
+                    <div>
+                        <div class="flex justify-between items-center mb-1">
+                             <label class="block text-sm font-medium text-gray-700">Shared By:</label>
+                             <button id="suggestSharersButton" class="btn-ai text-xs px-2 py-1 hidden">✨ Suggest Sharers</button>
+                        </div>
+                        <div id="expenseSharedBy" class="space-y-1 p-2 border border-gray-300 rounded-md bg-gray-50 max-h-32 overflow-y-auto">
+                            <p class="text-gray-400 text-sm">Add participants first</p>
+                        </div>
+                    </div>
+                    <button id="addExpenseButton" class="btn-primary w-full">Add Expense</button>
+                </div>
+                <div id="expensesList" class="mt-6 space-y-3">
+                    <p class="text-gray-500">Loading expenses...</p>
+                </div>
+            </section>
+        </div>
+
+        <section class="card mt-6">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-700">3. Settlement & Reports</h2>
+            <div class="space-y-3">
+                <button id="calculateButton" class="btn-primary w-full">Calculate & Simplify Debts</button>
+                <button id="generateReportButton" class="btn-ai w-full">✨ Generate Spending Report</button>
+            </div>
+            <div id="results" class="mt-6">
+                <p class="text-gray-500 text-center">Calculate to see who owes whom.</p>
+            </div>
+            <div id="spendingReportDiv" class="mt-6">
+                </div>
+        </section>
+
+        <footer class="text-center mt-12 mb-6">
+            <p class="text-sm text-gray-500">&copy; <span id="currentYear"></span> Holiday Splitter AI. Your data is stored per App ID.</p>
+        </footer>
+    </div>
+    <script>
+        document.getElementById('currentYear').textContent = new Date().getFullYear();
+    </script>
+</body>
+</html>
